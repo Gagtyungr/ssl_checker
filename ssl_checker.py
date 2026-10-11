@@ -1,31 +1,41 @@
 import ssl
 import socket
-import base64
-import tempfile
-import os
 import threading
 from urllib.parse import urlparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
-TIMEOUT = 10 # секунд, сетевое ограничение.
+TIMEOUT = 10  # секунд — единственное сетевое ограничение во всей программе
 
-try:
-    from cryptography import x509
-    from cryptography.hazmat.backends import default_backend
-    _HAS_CRYPTO = True
-except Exception:
-    _HAS_CRYPTO = False
-
-_NAME_MAP = {
-    'commonName': 'CN', 'organizationName': 'O', 'organizationalUnitNam': 'OU',
-    'countryName': 'C', 'stateOrProvinceName': 'ST', 'localityName': 'L',
-    'domainComponent': 'DC', 'emailAddress': 'E', 'serialNumber': 'SERIAL',
+# ── OID-справочники (чтобы не тянуть внешние библиотеки) ──────────
+_ATTR_OID = {
+    '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.5': 'SERIAL', '2.5.4.7': 'L',
+    '2.5.4.8': 'ST', '2.5.4.10': 'O', '2.5.4.11': 'OU',
+    '0.9.2342.19200300.100.1.25': 'DC', '1.2.840.113549.1.9.1': 'E',
+}
+_SIG_OID = {
+    '1.2.840.113549.1.1.11': 'sha256WithRSAEncryption',
+    '1.2.840.113549.1.1.12': 'sha384WithRSAEncryption',
+    '1.2.840.113549.1.1.13': 'sha512WithRSAEncryption',
+    '1.2.840.113549.1.1.5':  'sha1WithRSAEncryption',
+    '1.2.840.10045.4.3.2':   'ecdsa-with-SHA256',
+    '1.2.840.10045.4.3.3':   'ecdsa-with-SHA384',
+    '1.2.840.10045.4.3.4':   'ecdsa-with-SHA512',
+    '1.3.101.112':           'ED25519',
+    '1.3.101.113':           'ED448',
+}
+_RSA_OID  = '1.2.840.113549.1.1.1'
+_EC_OID   = '1.2.840.10045.2.1'
+_SAN_OID  = '2.5.29.17'
+_CURVE_BITS = {
+    '1.2.840.10045.3.1.7': 256, '1.3.132.0.34': 384, '1.3.132.0.35': 521,
+    '1.3.101.110': 256, '1.3.101.111': 448,
 }
 
 
+# ─────────────────────────── сеть: ровно 1 соединение ───────────────────────────
 def extract_host_port(raw: str):
     raw = (raw or '').strip()
     if not raw:
@@ -43,117 +53,206 @@ def extract_host_port(raw: str):
 
 
 def fetch_der(host: str, port: int) -> bytes:
-    """Единственное сетевое действие: TCP + TLS handsnake -> DER сертификата -> close."""
+    """Единственное сетевое действие: TCP + TLS handshake -> DER сертификата -> close.
+    Работает на любой сборке, где есть модуль ssl (включая Store/conda)."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False                      # Просрочка!
-    ctx.verify_mode = ssl.CERT_NONE                 # Запрос инфы.
+    ctx.check_hostname = False          # читаем и просроченные / самоподписанные
+    ctx.verify_mode = ssl.CERT_NONE     # нужна ИНФОРМАЦИЯ, а не проверка доверия
     with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as tls:
             der = tls.getpeercert(binary_form=True)
-        if not der:
-            raise RuntimeError(f'Порт {port} не отдал SSL-сертификат (это не HTTPS).')
-        return der
+    if not der:
+        raise RuntimeError(f'Порт {port} не отдал SSL-сертификат (похоже, это не HTTPS).')
+    return der
 
 
-def _der_to_pem(der: bytes) -> str:
-    b = base64.encodebytes(der).decode('ascii')
-    return '-----BEGIN CERTIFICATE-----\n' + b + '-----END CERTIFICATE-----\n'
+# ─────────────────── собственный парсер DER / ASN.1 (чистый Python) ───────────────────
+def _read_tlv(buf: bytes, i: int):
+    """Один TLV -> (tag, value_bytes, next_offset). Поддержка short/long length."""
+    tag = buf[i]; i += 1
+    ln = buf[i]; i += 1
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(buf[i:i + n], 'big'); i += n
+    return tag, buf[i:i + ln], i + ln
 
 
-def _parse_when(s):
-    """'May 10 12:34:56 2026 GMT' -> aware datetime (UTC)."""
-    if not s:
-        return None
-    try:
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(s)
-        return dt.astimezone(timezone.uts) if dt.tzinfo else dt.replace(tzinfo=timezone.uts)
-    except Exception:
-        pass
-    for fmt in ('%b %d %H:%M:%S %Y %Z', '%b  %d %H:%M:%S %Y %Z'):
-        try:
-            return datetime.strftime(s, fmt).replace(tzinfo=timezone.uts)
-        except Exception:
-            continue
-    return None
-
-
-def _fmt_name(tuples) -> str:
-    parts = []
-    for rdn in (tuples or()):
-        for av in rdn:
-            k, v = av[0], av[1]
-            parts.append(f'{_NAME_MAP.get(k,k)}={v}')
-    return ', '.join(parts) or '(пусто)'
-
-
-def _sans_from_dict(info) -> list:
-    out = []
-    for typ, val in (info.get('subjectAltName') or ()):
-        if typ in ('DNS', 'IP Address', 'IPAddress'):
-            out.append(str(val))
+def _children(seq_val: bytes):
+    """Список [(tag, value), ...] непосредственных элементов SEQUENCE/SET."""
+    out, i = [], 0
+    while i < len(seq_val):
+        t, v, i = _read_tlv(seq_val, i)
+        out.append((t, v))
     return out
 
 
-def decode_stdlib(der: bytes) -> dict:
-    """Разбор через стандартный модуль ssl (без внешних пакетов)."""
-    pem = _der_to_pem(der)
-    fd, path = tempfile.mkstemp(suffix='.pem')
-    try:
-        with os.fdopen(fd, 'w') as f:
-            f.write(pem)
-        raw = ssl._test_decode_cert(path)         
-    finally:
+def _decode_oid(b: bytes) -> str:
+    if not b:
+        return ''
+    parts = [str(b[0] // 40), str(b[0] % 40)]
+    val = 0
+    for byte in b[1:]:
+        val = (val << 7) | (byte & 0x7F)
+        if not (byte & 0x80):
+            parts.append(str(val)); val = 0
+    return '.'.join(parts)
+
+
+def _text_of(value: bytes) -> str:
+    # String-типы в сертификате: UTF8String/PrintableString/IA5/Teletex/etc.
+    for enc in ('utf-8', 'latin-1'):
         try:
-            os.unlink(path)
-        except OSError:
-            pass
-    nb = _parse_when(raw.get('notBefore'))
-    na = _parse_when(raw.get('notAfter'))
+            return value.decode(enc)
+        except Exception:
+            continue
+    return value.hex()
+
+
+def _format_name(name_val: bytes) -> str:
+    parts = []
+    for _rtag, rdn in _children(name_val):          # RDN = SET OF ATV
+        for _atag, atv in _children(rdn):           # ATV = SEQUENCE { OID, value }
+            kids = _children(atv)
+            if len(kids) < 2:
+                continue
+            oid = _decode_oid(kids[0][1])
+            label = _ATTR_OID.get(oid, oid)
+            parts.append(f'{label}={_text_of(kids[1][1])}')
+    return ', '.join(parts) or '(пусто)'
+
+
+def _parse_time(tag: int, value: bytes):
+    s = _text_of(value).strip()
+    off = timedelta(0)
+    if s.endswith('Z'):
+        s = s[:-1]
+    else:
+        for sign_idx in range(len(s) - 1, 1, -1):   # ищем смещение +HHMM / -HHMM
+            if s[sign_idx] in '+-':
+                sign = 1 if s[sign_idx] == '+' else -1
+                tzpart = s[sign_idx + 1:].replace(':', '')
+                if len(tzpart) >= 4:
+                    hh = int(tzpart[0:2]); mm = int(tzpart[2:4]) if len(tzpart) >= 4 else 0
+                    off = sign * timedelta(hours=hh, minutes=mm)
+                s = s[:sign_idx]
+                break
+    if '.' in s:
+        s = s.split('.')[0]
+    try:
+        if tag == 0x17:                              # UTCTime  YYMMDDHHMMSS
+            yy = int(s[0:2]); yr = 2000 + yy if yy < 50 else 1900 + yy
+            mo, da, hh, mi, se = (int(s[i:i + 2]) for i in (2, 4, 6, 8, 10))
+        else:                                        # GeneralizedTime YYYYMMDDHHMMSS
+            yr = int(s[0:4])
+            mo, da, hh, mi, se = (int(s[i:i + 2]) for i in (4, 6, 8, 10, 12))
+        return datetime(yr, mo, da, hh, mi, se, tzinfo=timezone.utc) - off
+    except Exception:
+        return None
+
+
+def _parse_spki(spki_val: bytes):
+    """-> (key_alg:str|None, key_bits:int|None, sig_alg_from_tbs=None)."""
+    kids = _children(spki_val)
+    if not kids:
+        return None, None
+    alg_oid = None
+    for _t, v in _children(kids[0][1]):              # AlgorithmIdentifier SEQUENCE
+        if _t == 0x06:
+            alg_oid = _decode_oid(v); break
+    if alg_oid == _RSA_OID:
+        # pubkey BIT STRING: первый байт = unused bits, далее DER SEQUENCE {modulus, exponent}
+        if len(kids) > 1 and kids[1][0] == 0x03 and kids[1][1]:
+            inner = kids[1][1][1:]
+            mk = _children(inner)
+            if mk:
+                modulus = int.from_bytes(mk[0][1], 'big')
+                return 'RSA', modulus.bit_length()
+        return 'RSA', None
+    if alg_oid == _EC_OID:
+        curve = None
+        for _t, v in _children(kids[0][1]):
+            if _t == 0x06 and _decode_oid(v) != _EC_OID:
+                curve = _decode_oid(v)
+        return 'EC', _CURVE_BITS.get(curve)
+    if alg_oid in _SIG_OID:                          # ed25519/ed448 как ключ тоже
+        return _SIG_OID[alg_oid], _CURVE_BITS.get(alg_oid)
+    return (_SIG_OID.get(alg_oid) or alg_oid or None), None
+
+
+def _parse_extensions(ext_seq_val: bytes):
+    """-> список SAN (dns/ip строки)."""
+    sans = []
+    for _t, ext in _children(ext_seq_val):           # каждый Extension = SEQUENCE
+        ek = _children(ext)
+        if len(ek) < 2:
+            continue
+        if _decode_oid(ek[0][1]) != _SAN_OID:
+            continue
+        octet = ek[-1][1]                            # OCTET STRING всегда последний
+        for gtag, gval in _children(octet):          # GeneralNames SEQUENCE OF GeneralName
+            if gtag == 0x82:                         # dNSName [2]
+                sans.append(_text_of(gval))
+            elif gtag == 0x87:                       # iPAddress [7]
+                if len(gval) == 4:
+                    sans.append('.'.join(str(b) for b in gval))
+                elif len(gval) == 16:
+                    sans.append(':'.join(f'{gval[i]:02x}{gval[i+1]:02x}' for i in range(0, 16, 2)))
+    return sans
+
+
+def parse_der(der: bytes) -> dict:
+    """Разбирает DER X.509 в dict без приватных API и без внешних библиотек."""
+    root_kids = _children(_read_tlv(der, 0)[1])      # Certificate -> [tbs, sigAlg, sigVal]
+    tbs_val = root_kids[0][1]
+    sig_alg = None
+    if len(root_kids) > 1:                           # внешний signatureAlgorithm
+        sa = _children(root_kids[1][1])
+        if sa and sa[0][0] == 0x06:
+            sig_alg = _SIG_OID.get(_decode_oid(sa[0][1])) or _decode_oid(sa[0][1])
+
+    kids = _children(tbs_val)
+    idx = 0
+    raw_ver = 0
+    if kids and kids[0][0] == 0xA0:                  # [0] EXPLICIT version
+        vi = _children(kids[0][1])
+        if vi:
+            raw_ver = int.from_bytes(vi[0][1], 'big')
+        idx = 1
+    serial = ''
+    if idx < len(kids) and kids[idx][0] == 0x02:
+        serial = format(int.from_bytes(kids[idx][1], 'big'), 'X'); idx += 1
+    if idx < len(kids) and kids[idx][0] == 0x30:     # signature (дублирует внешний)
+        sa = _children(kids[idx][1])
+        if sa and sa[0][0] == 0x06 and not sig_alg:
+            sig_alg = _SIG_OID.get(_decode_oid(sa[0][1])) or _decode_oid(sa[0][1])
+        idx += 1
+    issuer = _format_name(kids[idx][1]) if idx < len(kids) else ''; idx += 1
+    nb = na = None
+    if idx < len(kids) and kids[idx][0] == 0x30:     # validity
+        vk = _children(kids[idx][1])
+        if len(vk) >= 2:
+            nb = _parse_time(vk[0][0], vk[0][1])
+            na = _parse_time(vk[1][0], vk[1][1])
+        idx += 1
+    subject = _format_name(kids[idx][1]) if idx < len(kids) else ''; idx += 1
+    key_alg = key_bits = None
+    if idx < len(kids) and kids[idx][0] == 0x30:     # subjectPublicKeyInfo
+        key_alg, key_bits = _parse_spki(kids[idx][1]); idx += 1
+    sans = []
+    for t, v in kids[idx:]:                          # ищем [3] EXPLICIT extensions
+        if t == 0xA3:
+            sans = _parse_extensions(v); break
+
     days = (na - datetime.now(timezone.utc)).days if na else None
     return {
-        'subject': _fmt_name(raw.get('subject')),
-        'issuer': _fmt_name(raw.get('issuer')),
-        'serial': str(raw.get('serialNumber', '')),
-        'version': {0: 'v1', 1: 'v2', 2: 'v3'}.get(raw.get('version', 2), 'v3'),
-        'nb': nb, 'na': na, 'days': days,
-        'sans': _sans_from_dict(raw),
+        'subject': subject, 'issuer': issuer, 'serial': serial,
+        'version': {0: 'v1', 1: 'v2', 2: 'v3'}.get(raw_ver, f'v{raw_ver}'),
+        'sig_alg': sig_alg, 'key_alg': key_alg, 'key_bits': key_bits,
+        'nb': nb, 'na': na, 'days': days, 'sans': sans,
     }
 
 
-def _blank_info() -> dict:
-    return {'subject': '', 'issuer': '', 'serial': '', 'version': 'v3',
-            'nb': None, 'na': None, 'days': None, 'sans': []}
-
-
-def enrich_crypto(der: bytes, info: dict) -> None:
-    """Доп. поля (алгоритм подписи, тип/размер ключа) — только если cryptography стоит."""
-    if not _HAS_CRYPTO:
-        return
-    try:
-        c = x509.load_der_x509_certificate(der, default_backend())
-        info['sig_alg'] = getattr(c.signature_algorithm_oid, '_name',
-                                  str(c.signature_algorithm_oid))
-        info['key_alg'] = type(c.public_key()).__name__.replace('PublicKey', '')
-        try:
-            info['key_bits'] = c.public_key().key_size
-        except Exception:
-            pass
-        if not info.get('sans'):
-            ext = c.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            info['sans'] = ext.value.get_values_for_type(x509.DNSName)
-        if not info.get('na'):
-            try:
-                info['nb'] = c.not_valid_before_utc
-                info['na'] = c.not_valid_after_utc
-            except AttributeError:
-                info['nb'] = c.not_valid_before.replace(tzinfo=timezone.utc)
-                info['na'] = c.not_valid_after.replace(tzinfo=timezone.utc)
-            info['days'] = (info['na'] - datetime.now(timezone.utc)).days
-    except Exception:
-        pass
-
-
+# ─────────────────────────── проверка и статус ───────────────────────────
 def check_ssl(host: str, port: int) -> dict:
     res = {'host': host, 'port': port, 'ok': False, 'err': None}
     try:
@@ -171,21 +270,10 @@ def check_ssl(host: str, port: int) -> dict:
     except Exception as e:
         res['err'] = f'{type(e).__name__}: {e}'; return res
 
-    
-    info, err_parse = None, None
     try:
-        info = decode_stdlib(der)
+        info = parse_der(der)
     except Exception as e:
-        err_parse = e
-    if _HAS_CRYPTO:
-        if info is None:
-            info = _blank_info()
-        try:
-            enrich_crypto(der, info)
-        except Exception as e:
-            err_parse = err_parse or e
-    if not info or (not info.get('na') and not info.get('subject')):
-        res['err'] = f'Не удалось разобрать сертификат: {err_parse or "нет данных"}'
+        res['err'] = f'Не удалось разобрать сертификат: {type(e).__name__}: {e}'
         return res
 
     days = info.get('days')
@@ -202,7 +290,8 @@ def check_ssl(host: str, port: int) -> dict:
     return res
 
 
-def report(r: dict) -> str: # Отчёт.
+# ─────────────────────────── отчёт ───────────────────────────
+def report(r: dict) -> str:
     bar = '═' * 50
     L = [bar, f'  Хост : {r["host"]}:{r["port"]}', bar]
     if r.get('err'):
@@ -232,7 +321,8 @@ def report(r: dict) -> str: # Отчёт.
     return '\n'.join(L)
 
 
-class App:                          #GUI
+# ─────────────────────────── GUI (tkinter — встроен в Python) ───────────────────────────
+class App:
     def __init__(self, root):
         self.root = root
         root.title('SSL Checker')
@@ -273,6 +363,7 @@ class App:                          #GUI
                   font=('Segoe UI', 8), padding=(10, 2, 10, 6),
                   text='ℹ  1 соединение · без HTTP-запросов · без сканирования портов · '
                        'без отправки данных наружу · работает локально').pack(fill=tk.X)
+
     def _go(self):
         raw = self.var.get().strip()
         if not raw:
@@ -308,4 +399,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
