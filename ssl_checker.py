@@ -7,9 +7,8 @@ from datetime import datetime, timedelta, timezone
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 
-TIMEOUT = 10  # секунд — единственное сетевое ограничение во всей программе
+TIMEOUT = 10  #__________секунд/seconds
 
-# ── OID-справочники (чтобы не тянуть внешние библиотеки) ──────────
 _ATTR_OID = {
     '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.5': 'SERIAL', '2.5.4.7': 'L',
     '2.5.4.8': 'ST', '2.5.4.10': 'O', '2.5.4.11': 'OU',
@@ -34,9 +33,8 @@ _CURVE_BITS = {
     '1.3.101.110': 256, '1.3.101.111': 448,
 }
 
-
-# ─────────────────────────── сеть: ровно 1 соединение ───────────────────────────
-def extract_host_port(raw: str):
+#__________сеть: соединение/network: connection 
+def extract_host_port(raw: str):        
     raw = (raw or '').strip()
     if not raw:
         raise ValueError('Введите ссылку')
@@ -56,8 +54,8 @@ def fetch_der(host: str, port: int) -> bytes:
     """Единственное сетевое действие: TCP + TLS handshake -> DER сертификата -> close.
     Работает на любой сборке, где есть модуль ssl (включая Store/conda)."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False          # читаем и просроченные / самоподписанные
-    ctx.verify_mode = ssl.CERT_NONE     # нужна ИНФОРМАЦИЯ, а не проверка доверия
+    ctx.check_hostname = False          #__________просроченные, самоподписанные/expired, self‑signed
+    ctx.verify_mode = ssl.CERT_NONE     #__________нужна ИНФОРМАЦИЯ/INFORMATION is needed. 
     with socket.create_connection((host, port), timeout=TIMEOUT) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as tls:
             der = tls.getpeercert(binary_form=True)
@@ -65,9 +63,8 @@ def fetch_der(host: str, port: int) -> bytes:
         raise RuntimeError(f'Порт {port} не отдал SSL-сертификат (похоже, это не HTTPS).')
     return der
 
-
-# ─────────────────── собственный парсер DER / ASN.1 (чистый Python) ───────────────────
-def _read_tlv(buf: bytes, i: int):
+#__________парсер/parser
+def _read_tlv(buf: bytes, i: int):                      
     """Один TLV -> (tag, value_bytes, next_offset). Поддержка short/long length."""
     tag = buf[i]; i += 1
     ln = buf[i]; i += 1
@@ -99,7 +96,6 @@ def _decode_oid(b: bytes) -> str:
 
 
 def _text_of(value: bytes) -> str:
-    # String-типы в сертификате: UTF8String/PrintableString/IA5/Teletex/etc.
     for enc in ('utf-8', 'latin-1'):
         try:
             return value.decode(enc)
@@ -110,8 +106,8 @@ def _text_of(value: bytes) -> str:
 
 def _format_name(name_val: bytes) -> str:
     parts = []
-    for _rtag, rdn in _children(name_val):          # RDN = SET OF ATV
-        for _atag, atv in _children(rdn):           # ATV = SEQUENCE { OID, value }
+    for _rtag, rdn in _children(name_val):          
+        for _atag, atv in _children(rdn):           
             kids = _children(atv)
             if len(kids) < 2:
                 continue
@@ -127,7 +123,7 @@ def _parse_time(tag: int, value: bytes):
     if s.endswith('Z'):
         s = s[:-1]
     else:
-        for sign_idx in range(len(s) - 1, 1, -1):   # ищем смещение +HHMM / -HHMM
+        for sign_idx in range(len(s) - 1, 1, -1):  
             if s[sign_idx] in '+-':
                 sign = 1 if s[sign_idx] == '+' else -1
                 tzpart = s[sign_idx + 1:].replace(':', '')
@@ -139,10 +135,10 @@ def _parse_time(tag: int, value: bytes):
     if '.' in s:
         s = s.split('.')[0]
     try:
-        if tag == 0x17:                              # UTCTime  YYMMDDHHMMSS
+        if tag == 0x17:                              
             yy = int(s[0:2]); yr = 2000 + yy if yy < 50 else 1900 + yy
             mo, da, hh, mi, se = (int(s[i:i + 2]) for i in (2, 4, 6, 8, 10))
-        else:                                        # GeneralizedTime YYYYMMDDHHMMSS
+        else:                                        
             yr = int(s[0:4])
             mo, da, hh, mi, se = (int(s[i:i + 2]) for i in (4, 6, 8, 10, 12))
         return datetime(yr, mo, da, hh, mi, se, tzinfo=timezone.utc) - off
@@ -156,11 +152,10 @@ def _parse_spki(spki_val: bytes):
     if not kids:
         return None, None
     alg_oid = None
-    for _t, v in _children(kids[0][1]):              # AlgorithmIdentifier SEQUENCE
+    for _t, v in _children(kids[0][1]):            
         if _t == 0x06:
             alg_oid = _decode_oid(v); break
     if alg_oid == _RSA_OID:
-        # pubkey BIT STRING: первый байт = unused bits, далее DER SEQUENCE {modulus, exponent}
         if len(kids) > 1 and kids[1][0] == 0x03 and kids[1][1]:
             inner = kids[1][1][1:]
             mk = _children(inner)
@@ -174,7 +169,7 @@ def _parse_spki(spki_val: bytes):
             if _t == 0x06 and _decode_oid(v) != _EC_OID:
                 curve = _decode_oid(v)
         return 'EC', _CURVE_BITS.get(curve)
-    if alg_oid in _SIG_OID:                          # ed25519/ed448 как ключ тоже
+    if alg_oid in _SIG_OID:                          
         return _SIG_OID[alg_oid], _CURVE_BITS.get(alg_oid)
     return (_SIG_OID.get(alg_oid) or alg_oid or None), None
 
@@ -182,17 +177,17 @@ def _parse_spki(spki_val: bytes):
 def _parse_extensions(ext_seq_val: bytes):
     """-> список SAN (dns/ip строки)."""
     sans = []
-    for _t, ext in _children(ext_seq_val):           # каждый Extension = SEQUENCE
+    for _t, ext in _children(ext_seq_val):           
         ek = _children(ext)
         if len(ek) < 2:
             continue
         if _decode_oid(ek[0][1]) != _SAN_OID:
             continue
-        octet = ek[-1][1]                            # OCTET STRING всегда последний
-        for gtag, gval in _children(octet):          # GeneralNames SEQUENCE OF GeneralName
-            if gtag == 0x82:                         # dNSName [2]
+        octet = ek[-1][1]                            
+        for gtag, gval in _children(octet):          
+            if gtag == 0x82:                         #__________dNSName 
                 sans.append(_text_of(gval))
-            elif gtag == 0x87:                       # iPAddress [7]
+            elif gtag == 0x87:                       #__________iPAddress 
                 if len(gval) == 4:
                     sans.append('.'.join(str(b) for b in gval))
                 elif len(gval) == 16:
@@ -202,10 +197,10 @@ def _parse_extensions(ext_seq_val: bytes):
 
 def parse_der(der: bytes) -> dict:
     """Разбирает DER X.509 в dict без приватных API и без внешних библиотек."""
-    root_kids = _children(_read_tlv(der, 0)[1])      # Certificate -> [tbs, sigAlg, sigVal]
+    root_kids = _children(_read_tlv(der, 0)[1])      
     tbs_val = root_kids[0][1]
     sig_alg = None
-    if len(root_kids) > 1:                           # внешний signatureAlgorithm
+    if len(root_kids) > 1:                           
         sa = _children(root_kids[1][1])
         if sa and sa[0][0] == 0x06:
             sig_alg = _SIG_OID.get(_decode_oid(sa[0][1])) or _decode_oid(sa[0][1])
@@ -213,7 +208,7 @@ def parse_der(der: bytes) -> dict:
     kids = _children(tbs_val)
     idx = 0
     raw_ver = 0
-    if kids and kids[0][0] == 0xA0:                  # [0] EXPLICIT version
+    if kids and kids[0][0] == 0xA0:                  
         vi = _children(kids[0][1])
         if vi:
             raw_ver = int.from_bytes(vi[0][1], 'big')
@@ -221,7 +216,7 @@ def parse_der(der: bytes) -> dict:
     serial = ''
     if idx < len(kids) and kids[idx][0] == 0x02:
         serial = format(int.from_bytes(kids[idx][1], 'big'), 'X'); idx += 1
-    if idx < len(kids) and kids[idx][0] == 0x30:     # signature (дублирует внешний)
+    if idx < len(kids) and kids[idx][0] == 0x30:     
         sa = _children(kids[idx][1])
         if sa and sa[0][0] == 0x06 and not sig_alg:
             sig_alg = _SIG_OID.get(_decode_oid(sa[0][1])) or _decode_oid(sa[0][1])
@@ -236,10 +231,10 @@ def parse_der(der: bytes) -> dict:
         idx += 1
     subject = _format_name(kids[idx][1]) if idx < len(kids) else ''; idx += 1
     key_alg = key_bits = None
-    if idx < len(kids) and kids[idx][0] == 0x30:     # subjectPublicKeyInfo
+    if idx < len(kids) and kids[idx][0] == 0x30:    
         key_alg, key_bits = _parse_spki(kids[idx][1]); idx += 1
     sans = []
-    for t, v in kids[idx:]:                          # ищем [3] EXPLICIT extensions
+    for t, v in kids[idx:]:                          
         if t == 0xA3:
             sans = _parse_extensions(v); break
 
@@ -251,9 +246,8 @@ def parse_der(der: bytes) -> dict:
         'nb': nb, 'na': na, 'days': days, 'sans': sans,
     }
 
-
-# ─────────────────────────── проверка и статус ───────────────────────────
-def check_ssl(host: str, port: int) -> dict:
+#__________проверка и статус/check and status
+def check_ssl(host: str, port: int) -> dict:                                
     res = {'host': host, 'port': port, 'ok': False, 'err': None}
     try:
         der = fetch_der(host, port)
@@ -289,9 +283,8 @@ def check_ssl(host: str, port: int) -> dict:
     res.update(ok=True, **info)
     return res
 
-
-# ─────────────────────────── отчёт ───────────────────────────
-def report(r: dict) -> str:
+#__________отчёт/report
+def report(r: dict) -> str:                                      
     bar = '═' * 50
     L = [bar, f'  Хост : {r["host"]}:{r["port"]}', bar]
     if r.get('err'):
@@ -320,9 +313,8 @@ def report(r: dict) -> str:
     L.append('\n' + bar)
     return '\n'.join(L)
 
-
-# ─────────────────────────── GUI (tkinter — встроен в Python) ───────────────────────────
-class App:
+#__________GUI 
+class App:                                                  
     def __init__(self, root):
         self.root = root
         root.title('SSL Checker')
@@ -340,6 +332,27 @@ class App:
         ttk.Label(top, text='Ссылка:').pack(side=tk.LEFT)
         self.var = tk.StringVar()
         e = ttk.Entry(top, textvariable=self.var, width=44)
+
+        #__________AI фикс/AI fix Ctrl+C / Ctrl+V 
+        _is_windows = (e.tk.call('tk', 'windowingsystem') == 'win32')
+
+        def _clip_fix(event):
+            if not (event.state & 0x0004):
+                return
+
+            ks = (event.keysym or '').lower()
+
+            if (_is_windows and event.keycode == 67) or ks in ('c', 'cyrillic_es', 'u0441', 'u0421'):
+                event.widget.event_generate('<<Copy>>')
+                return 'break'
+
+            if (_is_windows and event.keycode == 86) or ks in ('v', 'cyrillic_ve', 'u0432', 'u0412'):
+                event.widget.event_generate('<<Paste>>')
+                return 'break'
+
+        e.bind('<KeyPress>', _clip_fix)
+        # ------------------------------------------------------
+
         e.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
         e.bind('<Return>', lambda _: self._go())
         e.focus_set()
@@ -356,7 +369,7 @@ class App:
         self._write(
             'Введите ссылку и нажмите «Тест» (или Enter).\n\n'
             'Примеры:  example.com   https://www.google.com   github.com\n\n'
-            'Будет выполнено ОДНО TLS-соединение (как в браузере)\n'
+            'Будет выполнено TLS-соединение как в браузере\n'
             'и показаны данные публичного SSL-сертификата и срок его действия.')
 
         ttk.Label(self.root, wraplength=620, justify=tk.LEFT, foreground='#888',
